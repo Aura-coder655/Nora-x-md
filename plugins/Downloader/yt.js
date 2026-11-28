@@ -2,77 +2,129 @@ const fs = require('fs-extra');
 const yt = require('../../lib/yt-engine');
 
 const VIDEO_INLINE_LIMIT = 65 * 1024 * 1024;
+const MENU_MARKER = 'ɴᴏʀᴀ ʏᴏᴜᴛᴜʙᴇ ᴏᴘᴛɪᴏɴꜱ';
+
+async function sendDownloadedMedia(sock, from, msg, media, footerText = '') {
+    if (!media || !media.path || !(await fs.pathExists(media.path))) {
+        throw new Error('Media file was not generated.');
+    }
+
+    const { size } = await fs.stat(media.path);
+    if (!size) throw new Error('Downloaded media file is empty.');
+
+    if (media.ext === 'mp3' || media.mimetype === 'audio/mpeg') {
+        await sock.sendMessage(
+            from,
+            {
+                audio: { url: media.path },
+                mimetype: 'audio/mpeg',
+                ptt: false,
+                fileName: `${media.title || 'audio'}.mp3`
+            },
+            { quoted: msg }
+        );
+        return;
+    }
+
+    const caption =
+        `*◈ ɴᴏʀᴀ ʏᴏᴜᴛᴜʙᴇ*\n` +
+        `*🎬 ${media.title || 'YouTube Video'}*\n` +
+        `*⚡ ${media.quality || 'HD'} • ${yt.formatBytes(size)}*` +
+        footerText;
+
+    if (size > VIDEO_INLINE_LIMIT || media.playable === false) {
+        await sock.sendMessage(
+            from,
+            {
+                document: { url: media.path },
+                mimetype: 'video/mp4',
+                fileName: `${media.title || 'video'}.mp4`,
+                caption
+            },
+            { quoted: msg }
+        );
+    } else {
+        await sock.sendMessage(
+            from,
+            {
+                video: { url: media.path },
+                mimetype: 'video/mp4',
+                caption
+            },
+            { quoted: msg }
+        );
+    }
+}
+
+function extractQuotedText(msg) {
+    const ctx = msg.message?.extendedTextMessage?.contextInfo;
+    const quoted = ctx?.quotedMessage;
+    return (
+        quoted?.conversation ||
+        quoted?.extendedTextMessage?.text ||
+        quoted?.imageMessage?.caption ||
+        quoted?.videoMessage?.caption ||
+        ''
+    );
+}
+
+async function handleOptionReply(sock, msg, choiceText, footerText = '') {
+    const from = msg.key.remoteJid;
+    const quotedText = extractQuotedText(msg);
+    if (!/^\d+$/.test(choiceText.trim()) || !quotedText.toLowerCase().includes(MENU_MARKER)) {
+        return false;
+    }
+
+    const selectedNum = parseInt(choiceText.trim(), 10);
+    const idMatch = quotedText.match(/\[([a-zA-Z0-9_-]{11})\]/);
+    if (!idMatch) {
+        await sock.sendMessage(from, { text: '❌ *Video ID not found in menu.*' }, { quoted: msg });
+        return true;
+    }
+
+    const videoId = idMatch[1];
+    await sock.sendMessage(from, { react: { text: '⬇️', key: msg.key } });
+
+    let media = null;
+    try {
+        media = await yt.downloadByOption(videoId, selectedNum);
+        await sendDownloadedMedia(sock, from, msg, media, footerText);
+        await sock.sendMessage(from, { react: { text: '✅', key: msg.key } });
+    } catch (err) {
+        await sock.sendMessage(from, { react: { text: '❌', key: msg.key } });
+        await sock.sendMessage(from, { text: `❌ *ꜰᴀɪʟᴇᴅ:* ${err.message}` }, { quoted: msg });
+    } finally {
+        await yt.cleanup(media?.path);
+    }
+
+    return true;
+}
 
 module.exports = [
     {
         command: 'ytv',
         aliases: ['video', 'ytmp4'],
         category: 'downloader',
+        async before(sock, msg, { footerText }) {
+            const body =
+                msg.message?.conversation ||
+                msg.message?.extendedTextMessage?.text ||
+                '';
+            return await handleOptionReply(sock, msg, body.trim(), footerText);
+        },
         async execute(sock, msg, args, { reply, footerText, prefix }) {
             const from = msg.key.remoteJid;
             const rawInput = args.join(' ').trim();
-            const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-            const quotedText = quoted?.conversation || quoted?.extendedTextMessage?.text || quoted?.imageMessage?.caption || '';
+            const quotedText = extractQuotedText(msg);
 
             // 1️⃣ Number Reply Handler (Reply 1, 2, 3... to Quality Menu)
-            if (/^\d+$/.test(rawInput) && quotedText.includes('ɴᴏʀᴀ ʏᴏᴜᴛᴜʙᴇ ᴏᴘᴛɪᴏɴꜱ')) {
-                const selectedNum = parseInt(rawInput, 10);
-                const idMatch = quotedText.match(/\[([a-zA-Z0-9_-]{11})\]/);
-                if (!idMatch) return reply('❌ *Video ID not found in menu.*');
-
-                const videoId = idMatch[1];
-                const optionLines = quotedText.split('\n').filter((l) => /^\*\d+\.\*/.test(l.trim()));
-                const pickedLine = optionLines[selectedNum - 1];
-                if (!pickedLine) return reply('⚠️ *Invalid option number!*');
-
-                await sock.sendMessage(from, { react: { text: '⬇️', key: msg.key } });
-                let filePath = null;
-
-                try {
-                    if (/audio/i.test(pickedLine)) {
-                        const aud = await yt.downloadAudio(videoId);
-                        filePath = aud.path;
-                        await sock.sendMessage(from, {
-                            audio: { url: filePath },
-                            mimetype: aud.mimetype,
-                            ptt: false,
-                            fileName: `${aud.title}.${aud.ext}`
-                        }, { quoted: msg });
-                    } else {
-                        const quality = pickedLine.match(/(\d{3,4}p)/i)?.[1] || '360p';
-                        const vid = await yt.downloadVideo(videoId, quality);
-                        filePath = vid.path;
-
-                        const { size } = await fs.stat(filePath);
-                        const caption = `*◈ ɴᴏʀᴀ ʏᴏᴜᴛᴜʙᴇ*\n*🎬 ${vid.title}*\n*⚡ ${vid.quality} • ${yt.formatBytes(size)}*` + footerText;
-
-                        if (size > VIDEO_INLINE_LIMIT || !vid.playable) {
-                            await sock.sendMessage(from, {
-                                document: { url: filePath },
-                                mimetype: 'video/mp4',
-                                fileName: `${vid.title}.mp4`,
-                                caption
-                            }, { quoted: msg });
-                        } else {
-                            await sock.sendMessage(from, {
-                                video: { url: filePath },
-                                mimetype: 'video/mp4',
-                                caption
-                            }, { quoted: msg });
-                        }
-                    }
-                    await sock.sendMessage(from, { react: { text: '✅', key: msg.key } });
-                } catch (err) {
-                    await sock.sendMessage(from, { react: { text: '❌', key: msg.key } });
-                    reply(`❌ *ꜰᴀɪʟᴇᴅ:* ${err.message}`);
-                } finally {
-                    await yt.cleanup(filePath);
-                }
+            if (/^\d+$/.test(rawInput) && quotedText.toLowerCase().includes(MENU_MARKER)) {
+                await handleOptionReply(sock, msg, rawInput, footerText);
                 return;
             }
 
             // 2️⃣ Show All Available Qualities Menu or Direct Download if quality given
-            let query = rawInput || quotedText;
+            let query = rawInput || yt.youtubeUrlFrom(quotedText) || '';
             if (!query) {
                 return reply(
                     `⚠️ *Provide a YouTube URL or Video Name!*\n` +
@@ -86,7 +138,7 @@ module.exports = [
 
             await sock.sendMessage(from, { react: { text: '⏳', key: msg.key } });
 
-            let filePath = null;
+            let media = null;
             try {
                 let url = yt.youtubeUrlFrom(query);
                 if (!url) {
@@ -95,44 +147,36 @@ module.exports = [
                     url = results[0].url;
                 }
 
-                // Direct download if user explicitly passed quality (e.g. .ytv arz kiya 360p)
+                // Direct download if user explicitly passed quality (e.g. .ytv arz kiya 720p)
                 if (directQuality) {
                     await sock.sendMessage(from, { react: { text: '⬇️', key: msg.key } });
-                    const vid = await yt.downloadVideo(url, directQuality);
-                    filePath = vid.path;
-
-                    const { size } = await fs.stat(filePath);
-                    const caption = `*◈ ɴᴏʀᴀ ʏᴏᴜᴛᴜʙᴇ*\n*🎬 ${vid.title}*\n*⚡ ${vid.quality} • ${yt.formatBytes(size)}*` + footerText;
-
-                    if (size > VIDEO_INLINE_LIMIT || !vid.playable) {
-                        await sock.sendMessage(from, {
-                            document: { url: filePath },
-                            mimetype: 'video/mp4',
-                            fileName: `${vid.title}.mp4`,
-                            caption
-                        }, { quoted: msg });
-                    } else {
-                        await sock.sendMessage(from, {
-                            video: { url: filePath },
-                            mimetype: 'video/mp4',
-                            caption
-                        }, { quoted: msg });
-                    }
+                    media = await yt.downloadVideo(url, directQuality);
+                    await sendDownloadedMedia(sock, from, msg, media, footerText);
                     await sock.sendMessage(from, { react: { text: '✅', key: msg.key } });
                     return;
                 }
 
-                // Show ALL available qualities menu
+                // Show ALL available qualities menu (Option 1 = Highest Available Quality)
                 const info = await yt.getVideoInfo(url);
-                let menu = `*◈ ɴᴏʀᴀ ʏᴏᴜᴛᴜʙᴇ ᴏᴘᴛɪᴏɴꜱ*\n\n`;
+                const menuList = Array.isArray(info.menu) && info.menu.length
+                    ? info.menu
+                    : info.options.map((opt, idx) => ({
+                        number: idx + 1,
+                        badge: `${idx + 1}.`,
+                        type: opt.audio ? 'audio' : 'video',
+                        label: opt.audio ? 'Audio Only' : (idx === 0 ? `${opt.quality.toUpperCase()} (BEST)` : opt.quality.toUpperCase()),
+                        format: opt.audio ? 'MP3' : 'MP4',
+                        sizeText: opt.size ? yt.formatBytes(opt.size) : 'N/A'
+                    }));
+
+                let menu = `*◈ ${MENU_MARKER}*\n\n`;
                 menu += `*🎬 ${info.title}*\n`;
+                menu += `⏱️ *${info.duration || 'N/A'}*\n`;
                 menu += `[${info.videoId}]\n\n`;
-                info.options.forEach((opt, i) => {
-                    const label = opt.audio ? 'Audio Only' : opt.quality;
-                    const sizeStr = opt.size ? ` ~ _${yt.formatBytes(opt.size)}_` : '';
-                    menu += `*${i + 1}.* ${label}${sizeStr}\n`;
+                menuList.forEach((opt) => {
+                    menu += `*${opt.number}.* ${opt.label} • ${opt.format} • _${opt.sizeText}_\n`;
                 });
-                menu += `\n_Reply with a number (1-${info.options.length}) to download_` + footerText;
+                menu += `\n_Reply with a number (1-${menuList.length}) to download_` + footerText;
 
                 await sock.sendMessage(from, { text: menu }, { quoted: msg });
                 await sock.sendMessage(from, { react: { text: '✅', key: msg.key } });
@@ -140,7 +184,7 @@ module.exports = [
                 await sock.sendMessage(from, { react: { text: '❌', key: msg.key } });
                 reply(`❌ *ꜰᴀɪʟᴇᴅ:* ${err.message}`);
             } finally {
-                await yt.cleanup(filePath);
+                await yt.cleanup(media?.path);
             }
         }
     },

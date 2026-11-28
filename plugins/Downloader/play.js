@@ -1,4 +1,7 @@
+const fs = require('fs-extra');
 const yt = require('../../lib/yt-engine');
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 module.exports = [
     {
@@ -33,18 +36,36 @@ module.exports = [
                 const aud = await yt.downloadAudio(url);
                 filePath = aud.path;
 
-                await sock.sendMessage(from, {
-                    audio: { url: filePath },
-                    mimetype: aud.mimetype,
-                    ptt: false,
-                    fileName: `${aud.title}.${aud.ext}`
-                }, { quoted: msg });
+                if (!(await fs.pathExists(filePath))) {
+                    throw new Error('Audio file missing after download.');
+                }
+
+                const audioBuffer = await fs.readFile(filePath);
+                if (!audioBuffer || audioBuffer.length < 16384) {
+                    throw new Error('Downloaded audio file is incomplete.');
+                }
+
+                await sock.sendMessage(
+                    from,
+                    {
+                        audio: audioBuffer,
+                        mimetype: 'audio/mpeg',
+                        ptt: false,
+                        fileName: `${aud.title || 'audio'}.mp3`
+                    },
+                    { quoted: msg }
+                );
 
                 await sock.sendMessage(from, { react: { text: '✅', key: msg.key } });
             } catch (err) {
                 await sock.sendMessage(from, { react: { text: '❌', key: msg.key } });
-                await sock.sendMessage(from, { text: `❌ *ꜰᴀɪʟᴇᴅ:* ${err.message}` + footerText }, { quoted: msg });
+                await sock.sendMessage(
+                    from,
+                    { text: `❌ *ꜰᴀɪʟᴇᴅ:* ${err.message}` + (footerText || '') },
+                    { quoted: msg }
+                );
             } finally {
+                await delay(1500);
                 await yt.cleanup(filePath);
             }
         }
