@@ -1,190 +1,165 @@
-const fs = require('fs-extra');
-const yt = require('../../lib/yt-engine');
+const API_BASE = (process.env.KIRAXMD_API || 'https://kiraxmd-api.onrender.com').replace(/\/+$/, '');
 
-const VIDEO_INLINE_LIMIT = 65 * 1024 * 1024;
-const MENU_MARKER = 'ɴᴏʀᴀ ʏᴏᴜᴛᴜʙᴇ ᴏᴘᴛɪᴏɴꜱ';
+const YOUTUBE_HOSTS = new Set([
+    'youtube.com', 'www.youtube.com', 'm.youtube.com',
+    'music.youtube.com', 'youtu.be', 'www.youtu.be'
+]);
 
-async function sendDownloadedMedia(sock, from, msg, media, footerText = '') {
-    if (!media || !media.path || !(await fs.pathExists(media.path))) {
-        throw new Error('Media file was not generated.');
-    }
+function cleanName(name) {
+    return String(name || 'YouTube_Media')
+        .replace(/[\\/:*?"<>|\r\n]+/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 100) || 'YouTube_Media';
+}
 
-    const { size } = await fs.stat(media.path);
-    if (!size) throw new Error('Downloaded media file is empty.');
-
-    if (media.ext === 'mp3' || media.mimetype === 'audio/mpeg') {
-        await sock.sendMessage(
-            from,
-            {
-                audio: { url: media.path },
-                mimetype: 'audio/mpeg',
-                ptt: false,
-                fileName: `${media.title || 'audio'}.mp3`
-            },
-            { quoted: msg }
-        );
-        return;
-    }
-
-    const caption =
-        `*◈ ɴᴏʀᴀ ʏᴏᴜᴛᴜʙᴇ*\n` +
-        `*🎬 ${media.title || 'YouTube Video'}*\n` +
-        `*⚡ ${media.quality || 'HD'} • ${yt.formatBytes(size)}*` +
-        footerText;
-
-    if (size > VIDEO_INLINE_LIMIT || media.playable === false) {
-        await sock.sendMessage(
-            from,
-            {
-                document: { url: media.path },
-                mimetype: 'video/mp4',
-                fileName: `${media.title || 'video'}.mp4`,
-                caption
-            },
-            { quoted: msg }
-        );
-    } else {
-        await sock.sendMessage(
-            from,
-            {
-                video: { url: media.path },
-                mimetype: 'video/mp4',
-                caption
-            },
-            { quoted: msg }
-        );
+function extractYoutubeUrl(text = '') {
+    const match = String(text).match(/\bhttps?:\/\/\S+/i)?.[0];
+    if (!match) return null;
+    try {
+        const u = new URL(match.replace(/[)\]\.,!?>]*$/, ''));
+        const host = u.hostname.toLowerCase();
+        if (!YOUTUBE_HOSTS.has(host)) return null;
+        const [first, second] = u.pathname.split('/').filter(Boolean);
+        let id = null;
+        if (host.endsWith('youtu.be')) id = first;
+        else if (first === 'watch') id = u.searchParams.get('v');
+        else if (['shorts', 'live', 'embed', 'v'].includes(first)) id = second;
+        return /^[\w-]{11}$/.test(id || '') ? `https://www.youtube.com/watch?v=${id}` : null;
+    } catch {
+        return null;
     }
 }
 
-function extractQuotedText(msg) {
-    const ctx = msg.message?.extendedTextMessage?.contextInfo;
-    const quoted = ctx?.quotedMessage;
+function getQuotedText(msg) {
+    const q = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
     return (
-        quoted?.conversation ||
-        quoted?.extendedTextMessage?.text ||
-        quoted?.imageMessage?.caption ||
-        quoted?.videoMessage?.caption ||
+        q?.conversation ||
+        q?.extendedTextMessage?.text ||
+        q?.imageMessage?.caption ||
+        q?.videoMessage?.caption ||
         ''
     );
 }
 
-async function handleOptionReply(sock, msg, choiceText, footerText = '') {
-    const from = msg.key.remoteJid;
-    const quotedText = extractQuotedText(msg);
-    if (!/^\d+$/.test(choiceText.trim()) || !quotedText.toLowerCase().includes(MENU_MARKER)) {
-        return false;
+async function fetchJson(url, timeoutMs = 60000) {
+    const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!res.ok) throw new Error(`API HTTP ${res.status}`);
+    return await res.json();
+}
+
+async function searchYts(query, limit = 5) {
+    const data = await fetchJson(`${API_BASE}/api/yts?q=${encodeURIComponent(query)}&limit=${limit}`);
+    if (!data?.status || !Array.isArray(data.result) || !data.result.length) {
+        throw new Error('No YouTube results found.');
     }
-
-    const selectedNum = parseInt(choiceText.trim(), 10);
-    const idMatch = quotedText.match(/\[([a-zA-Z0-9_-]{11})\]/);
-    if (!idMatch) {
-        await sock.sendMessage(from, { text: '❌ *Video ID not found in menu.*' }, { quoted: msg });
-        return true;
-    }
-
-    const videoId = idMatch[1];
-    await sock.sendMessage(from, { react: { text: '⬇️', key: msg.key } });
-
-    let media = null;
-    try {
-        media = await yt.downloadByOption(videoId, selectedNum);
-        await sendDownloadedMedia(sock, from, msg, media, footerText);
-        await sock.sendMessage(from, { react: { text: '✅', key: msg.key } });
-    } catch (err) {
-        await sock.sendMessage(from, { react: { text: '❌', key: msg.key } });
-        await sock.sendMessage(from, { text: `❌ *ꜰᴀɪʟᴇᴅ:* ${err.message}` }, { quoted: msg });
-    } finally {
-        await yt.cleanup(media?.path);
-    }
-
-    return true;
+    return data.result;
 }
 
 module.exports = [
     {
-        command: 'ytv',
-        aliases: ['video', 'ytmp4'],
+        command: 'yt',
+        aliases: ['ytv', 'ytmp4', 'video'],
         category: 'downloader',
-        async before(sock, msg, { footerText }) {
-            const body =
-                msg.message?.conversation ||
-                msg.message?.extendedTextMessage?.text ||
-                '';
-            return await handleOptionReply(sock, msg, body.trim(), footerText);
-        },
-        async execute(sock, msg, args, { reply, footerText, prefix }) {
+        async execute(sock, msg, args, { reply, prefix }) {
             const from = msg.key.remoteJid;
-            const rawInput = args.join(' ').trim();
-            const quotedText = extractQuotedText(msg);
+            const raw = args.join(' ').trim() || getQuotedText(msg);
+            const url = extractYoutubeUrl(raw);
 
-            // 1️⃣ Number Reply Handler (Reply 1, 2, 3... to Quality Menu)
-            if (/^\d+$/.test(rawInput) && quotedText.toLowerCase().includes(MENU_MARKER)) {
-                await handleOptionReply(sock, msg, rawInput, footerText);
-                return;
+            if (!url) {
+                return reply(`⚠️ *Provide a valid YouTube link!*\n_Ex: ${prefix || '.'}yt https://youtu.be/..._`);
             }
-
-            // 2️⃣ Show All Available Qualities Menu or Direct Download if quality given
-            let query = rawInput || yt.youtubeUrlFrom(quotedText) || '';
-            if (!query) {
-                return reply(
-                    `⚠️ *Provide a YouTube URL or Video Name!*\n` +
-                    `_Ex: ${prefix || '.'}ytv arz kiya_\n` +
-                    `_Ex: ${prefix || '.'}ytv https://youtu.be/..._`
-                );
-            }
-
-            const directQuality = query.match(/(?:^|\s)(\d{3,4}p)\s*$/i)?.[1]?.toLowerCase() || null;
-            if (directQuality) query = query.replace(/(?:^|\s)\d{3,4}p\s*$/i, '').trim();
 
             await sock.sendMessage(from, { react: { text: '⏳', key: msg.key } });
 
-            let media = null;
             try {
-                let url = yt.youtubeUrlFrom(query);
-                if (!url) {
-                    const results = await yt.searchYoutube(query, 1);
-                    if (!results.length) throw new Error('No YouTube videos found.');
-                    url = results[0].url;
+                const data = await fetchJson(
+                    `${API_BASE}/api/ytv2?url=${encodeURIComponent(url)}&quality=720`
+                );
+                const info = data?.result;
+                if (!data?.status || !info?.download) {
+                    throw new Error(data?.message || 'Could not fetch 720p video link.');
                 }
 
-                // Direct download if user explicitly passed quality (e.g. .ytv arz kiya 720p)
-                if (directQuality) {
-                    await sock.sendMessage(from, { react: { text: '⬇️', key: msg.key } });
-                    media = await yt.downloadVideo(url, directQuality);
-                    await sendDownloadedMedia(sock, from, msg, media, footerText);
-                    await sock.sendMessage(from, { react: { text: '✅', key: msg.key } });
-                    return;
-                }
+                await sock.sendMessage(from, { react: { text: '⬇️', key: msg.key } });
 
-                // Show ALL available qualities menu (Option 1 = Highest Available Quality)
-                const info = await yt.getVideoInfo(url);
-                const menuList = Array.isArray(info.menu) && info.menu.length
-                    ? info.menu
-                    : info.options.map((opt, idx) => ({
-                        number: idx + 1,
-                        badge: `${idx + 1}.`,
-                        type: opt.audio ? 'audio' : 'video',
-                        label: opt.audio ? 'Audio Only' : (idx === 0 ? `${opt.quality.toUpperCase()} (BEST)` : opt.quality.toUpperCase()),
-                        format: opt.audio ? 'MP3' : 'MP4',
-                        sizeText: opt.size ? yt.formatBytes(opt.size) : 'N/A'
-                    }));
+                const title = info.title || 'YouTube Video';
+                const caption = `*${title}*\n\n*ɴᴏʀᴀ ʏᴛ ᴅᴏᴡɴʟᴏᴀᴅᴇʀ*\n_ᴘᴏᴡᴇʀᴇᴅ ʙʏ ɴᴏʀᴀ_`;
 
-                let menu = `*◈ ${MENU_MARKER}*\n\n`;
-                menu += `*🎬 ${info.title}*\n`;
-                menu += `⏱️ *${info.duration || 'N/A'}*\n`;
-                menu += `[${info.videoId}]\n\n`;
-                menuList.forEach((opt) => {
-                    menu += `*${opt.number}.* ${opt.label} • ${opt.format} • _${opt.sizeText}_\n`;
-                });
-                menu += `\n_Reply with a number (1-${menuList.length}) to download_` + footerText;
+                await sock.sendMessage(
+                    from,
+                    {
+                        video: { url: info.download },
+                        mimetype: 'video/mp4',
+                        caption
+                    },
+                    { quoted: msg }
+                );
 
-                await sock.sendMessage(from, { text: menu }, { quoted: msg });
                 await sock.sendMessage(from, { react: { text: '✅', key: msg.key } });
             } catch (err) {
                 await sock.sendMessage(from, { react: { text: '❌', key: msg.key } });
                 reply(`❌ *ꜰᴀɪʟᴇᴅ:* ${err.message}`);
-            } finally {
-                await yt.cleanup(media?.path);
+            }
+        }
+    },
+    {
+        command: 'play',
+        aliases: ['yta', 'ytmp3', 'song', 'audio'],
+        category: 'downloader',
+        async execute(sock, msg, args, { reply, prefix }) {
+            const from = msg.key.remoteJid;
+            const query = args.join(' ').trim() || getQuotedText(msg);
+
+            if (!query) {
+                return reply(
+                    `⚠️ *Provide a Song Name or YouTube Link!*\n` +
+                    `_Ex: ${prefix || '.'}play dhol baaje_\n` +
+                    `_Ex: ${prefix || '.'}play https://youtu.be/..._`
+                );
+            }
+
+            await sock.sendMessage(from, { react: { text: '⏳', key: msg.key } });
+
+            try {
+                let targetUrl = extractYoutubeUrl(query);
+
+                if (!targetUrl) {
+                    const results = await searchYts(query, 5);
+                    targetUrl = results[0]?.url;
+                    if (!targetUrl) throw new Error('No matching song found.');
+                }
+
+                const data = await fetchJson(
+                    `${API_BASE}/api/yta?url=${encodeURIComponent(targetUrl)}`
+                );
+                const info = data?.result;
+                if (!data?.status || !info?.audio_url) {
+                    throw new Error(data?.message || 'Could not fetch audio link.');
+                }
+
+                await sock.sendMessage(from, { react: { text: '⬇️', key: msg.key } });
+
+                const title = cleanName(info.title || 'YouTube_Audio');
+
+                await sock.sendMessage(
+                    from,
+                    {
+                        audio: { url: info.audio_url },
+                        mimetype: 'audio/mpeg',
+                        ptt: false,
+                        fileName: `${title}.mp3`
+                    },
+                    { quoted: msg }
+                );
+
+                await sock.sendMessage(from, { react: { text: '✅', key: msg.key } });
+            } catch (err) {
+                await sock.sendMessage(from, { react: { text: '❌', key: msg.key } });
+                reply(`❌ *ꜰᴀɪʟᴇᴅ:* ${err.message}`);
             }
         }
     },
@@ -194,18 +169,16 @@ module.exports = [
         category: 'downloader',
         async execute(sock, msg, args, { reply, prefix }) {
             const query = args.join(' ').trim();
-            if (!query) return reply(`⚠️ *Provide a search query!*\n_Ex: ${prefix || '.'}yts arz kiya_`);
+            if (!query) return reply(`⚠️ *Provide a search query!*\n_Ex: ${prefix || '.'}yts dhol baaje_`);
 
             await sock.sendMessage(msg.key.remoteJid, { react: { text: '🔎', key: msg.key } });
             try {
-                const results = await yt.searchYoutube(query, 5);
-                if (!results.length) return reply('❌ *No results found.*');
-
-                let text = `*◈ ʏᴏᴜᴛᴜʙᴇ ꜱᴇᴀʀᴄʜ*\n\n`;
+                const results = await searchYts(query, 5);
+                let out = `*◈ ʏᴏᴜᴛᴜʙᴇ ꜱᴇᴀʀᴄʜ*\n\n`;
                 results.forEach((v, i) => {
-                    text += `*${i + 1}. ${v.title}*\n⏱️ ${v.duration} • 👤 ${v.author}\n🔗 ${v.url}\n\n`;
+                    out += `*${i + 1}. ${v.title}*\n⏱️ ${v.duration || 'N/A'} • 👤 ${v.channel || 'YouTube'}\n🔗 ${v.url}\n\n`;
                 });
-                await reply(text.trim());
+                await reply(out.trim());
             } catch (err) {
                 reply(`❌ *Search failed:* ${err.message}`);
             }
