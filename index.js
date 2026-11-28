@@ -12,7 +12,6 @@ const path = require('path');
 const mongoose = require('mongoose');
 const config = require('./config');
 const messageHandler = require('./handlers');
-const ytEngine = require('./lib/yt-engine');
 
 // 🌐 Browser Test + Render Port Binding
 const PORT = process.env.PORT || 3000;
